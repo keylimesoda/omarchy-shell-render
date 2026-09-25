@@ -1,0 +1,51 @@
+#!/bin/bash
+# shell-render-launch — run a shell (default: quickshell) with the render
+# backend chosen in ~/.config/omarchy/shell-render.conf.
+#
+#   shell-render-launch [shell-command] [args...]
+#
+#   shell-render-launch quickshell                 # runs /usr/bin/quickshell
+#   shell-render-launch /usr/bin/quickshell -c ./shell
+#
+# Point your session launcher at this script instead of the shell binary
+# directly. When the backend is "software" the child is forced onto
+# Mesa/llvmpipe so its GL state cannot be corrupted by a saturated GPU
+# (driver resource exhaustion, e.g. while local inference pins the card).
+#
+# At start-up the script records the backend the shell was launched with in
+# ~/.config/omarchy/shell-render.applied, so the UI can flag a saved-but-not
+# yet applied switch ("restart pending").
+set -u
+
+CONF="${SHELL_RENDER_CONF:-$HOME/.config/omarchy/shell-render.conf}"
+APPLIED="${SHELL_RENDER_APPLIED:-$HOME/.config/omarchy/shell-render.applied}"
+
+render="gpu"
+if [[ -r $CONF ]]; then
+  value=$(grep -m1 '^render=' "$CONF" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+  [[ $value == "software" ]] && render="software"
+fi
+
+mkdir -p "$(dirname "$APPLIED")" 2>/dev/null || true
+printf 'render=%s\n' "$render" > "$APPLIED" 2>/dev/null || true
+
+if [[ $render == "software" ]]; then
+  export GALLIUM_DRIVER=llvmpipe
+  export LIBGL_ALWAYS_SOFTWARE=1
+  # Pin EGL to the Mesa vendor so eglInitialize never picks a hardware driver.
+  for f in /usr/share/glvnd/egl_vendor.d/50_mesa.json \
+           /usr/lib64/glvnd/egl_vendor.d/50_mesa.json \
+           /usr/lib/glvnd/egl_vendor.d/50_mesa.json; do
+    if [[ -r $f ]]; then
+      export __EGL_VENDOR_LIBRARY_FILENAMES="$f"
+      break
+    fi
+  done
+  if [[ -z ${__EGL_VENDOR_LIBRARY_FILENAMES:-} ]]; then
+    echo "shell-render-launch: warning: no Mesa EGL vendor file found; relying on LIBGL_ALWAYS_SOFTWARE alone" >&2
+  fi
+fi
+
+cmd=${1:-quickshell}
+shift 2>/dev/null || true
+exec "$cmd" "$@"

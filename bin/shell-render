@@ -1,0 +1,87 @@
+#!/bin/bash
+# shell-render — get/set the Omarchy shell (bar + menu) render backend.
+#
+#   shell-render            print configured backend (gpu|software)
+#   shell-render get        same
+#   shell-render status     print "configured applied": what the running shell
+#                           was started with (see shell-render-launch);
+#                           "gpu" when the marker is missing/unknown
+#   shell-render set MODE   gpu|software (persisted; takes effect on the next
+#                           shell start via the launcher wrapper)
+#   shell-render toggle     flip and print the new value
+#
+# State:   $HOME/.config/omarchy/shell-render.conf        (render=...)
+# Marker:  $HOME/.config/omarchy/shell-render.applied     (written by
+#           shell-render-launch at shell start)
+# Both paths can be overridden via $SHELL_RENDER_CONF / $SHELL_RENDER_APPLIED.
+set -euo pipefail
+
+CONF="${SHELL_RENDER_CONF:-$HOME/.config/omarchy/shell-render.conf}"
+APPLIED="${SHELL_RENDER_APPLIED:-$HOME/.config/omarchy/shell-render.applied}"
+
+configured() {
+  if [[ -r $CONF ]]; then
+    local v
+    v=$(grep -m1 '^render=' "$CONF" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+    if [[ $v == "software" || $v == "gpu" ]]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  fi
+  printf 'gpu\n'
+}
+
+applied() {
+  if [[ -r $APPLIED ]]; then
+    local v
+    v=$(grep -m1 '^render=' "$APPLIED" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+    if [[ $v == "software" || $v == "gpu" ]]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  fi
+  printf 'gpu\n'
+}
+
+write() {
+  local mode=$1
+  [[ $mode == "gpu" || $mode == "software" ]] || {
+    echo "shell-render: unknown mode '$mode' (use gpu|software)" >&2
+    return 1
+  }
+  mkdir -p "$(dirname "$CONF")"
+  # Rewrite only the render= line; preserve the file's comments.
+  if [[ -r $CONF ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk -v m="$mode" '
+      /^render=/ { print "render=" m; seen = 1; next }
+      { print }
+      END { if (!seen) print "render=" m }
+    ' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+  else
+    printf 'render=%s\n' "$mode" > "$CONF"
+  fi
+}
+
+case ${1:-get} in
+  get|"")
+    configured
+    ;;
+  status)
+    printf '%s %s\n' "$(configured)" "$(applied)"
+    ;;
+  set)
+    [[ $# -ge 2 ]] || { echo "shell-render: set requires gpu|software" >&2; exit 1; }
+    write "$2"
+    configured
+    ;;
+  toggle)
+    if [[ $(configured) == "software" ]]; then write gpu; else write software; fi
+    configured
+    ;;
+  *)
+    echo "shell-render: unknown command '$1' (get|status|set|toggle)" >&2
+    exit 1
+    ;;
+esac
