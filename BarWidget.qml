@@ -90,7 +90,10 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    refresh()
+    if (!shimProc.running) shimProc.running = true
+  }
 
   onOpenedChanged: {
     if (opened) {
@@ -119,6 +122,28 @@ Panel {
           root.shellRenderApplied = (parts.length >= 2 && parts[1] === "software") ? "software" : "gpu"
         }
       }
+    }
+  }
+
+  // Keeps the quickshell shim in mise's shims dir alive: mise regenerates
+  // that dir on tool changes and drops hand-added entries, so without this
+  // the launcher wiring is lost at the next tool update and the next shell
+  // start silently reverts to the GPU backend. `status` verifies the live
+  // process, so such a revert stays visible instead of hidden. Re-asserts
+  // on load (Component.onCompleted) and every 60s; `shell-render shim`
+  // does the same from a terminal.
+  Process {
+    id: shimProc
+    command: [root.cli, "shim", "--quiet"]
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
+  Timer {
+    interval: 60000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (!shimProc.running) shimProc.running = true
     }
   }
 

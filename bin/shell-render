@@ -3,21 +3,51 @@
 #
 #   shell-render            print configured backend (gpu|software)
 #   shell-render get        same
-#   shell-render status     print "configured applied": what the running shell
-#                           was started with (see shell-render-launch);
-#                           "gpu" when the marker is missing/unknown
+#   shell-render status     print "configured applied". "applied" is verified
+#                           against the *live* shell process (its /proc
+#                           environ and open device fds), not the marker
+#                           file: a start that missed the launcher wrapper
+#                           (shim lost, stock respawn) can run on the GPU
+#                           while the marker still says software. The marker
+#                           file is consulted only when no shell process is
+#                           running.
 #   shell-render set MODE   gpu|software (persisted; takes effect on the next
 #                           shell start via the launcher wrapper)
 #   shell-render toggle     flip and print the new value
+#   shell-render shim       verify/repair the quickshell shim in mise's shims
+#                           dir (--remove deletes it, --quiet prints nothing).
+#                           mise regenerates that directory on tool changes
+#                           and drops hand-added entries, so without
+#                           re-assertion the launcher wiring is lost at the
+#                           next tool update and shell starts silently
+#                           revert to the GPU backend. The bar widget
+#                           re-asserts the shim on load and every 60s; this
+#                           is the manual hook (also run by
+#                           shell-render-launch at every start).
+
+# Optional invocation trace: set SHELL_RENDER_TRACE=/path, or create the
+# default $XDG_RUNTIME_DIR/shell-render-trace sentinel file; each call is
+# logged there (timestamp, args, pid).
 #
 # State:   $HOME/.config/omarchy/shell-render.conf        (render=...)
 # Marker:  $HOME/.config/omarchy/shell-render.applied     (written by
 #           shell-render-launch at shell start)
 # Both paths can be overridden via $SHELL_RENDER_CONF / $SHELL_RENDER_APPLIED.
+# Shell binary name that status matches against: $SHELL_RENDER_SHELL
+# (default: quickshell). Mise shims dir: $MISE_DATA_DIR (default
+# ~/.local/share/mise), subdirectory "shims".
 set -euo pipefail
 
 CONF="${SHELL_RENDER_CONF:-$HOME/.config/omarchy/shell-render.conf}"
 APPLIED="${SHELL_RENDER_APPLIED:-$HOME/.config/omarchy/shell-render.applied}"
+SHELL_BIN="${SHELL_RENDER_SHELL:-quickshell}"
+SHIMS_DIR="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+PLUGIN_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
+
+TRACE="${SHELL_RENDER_TRACE:-${XDG_RUNTIME_DIR:-/tmp}/shell-render-trace}"
+if [[ -n ${SHELL_RENDER_TRACE:-} || -e $TRACE ]]; then
+  printf '%s shell-render %s (pid %d)\n' "$(date '+%H:%M:%S')" "${*:-get}" "$$" >> "$TRACE" 2>/dev/null || true
+fi
 
 configured() {
   if [[ -r $CONF ]]; then
@@ -31,7 +61,83 @@ configured() {
   printf 'gpu\n'
 }
 
+# --- Live process verification -----------------------------------------------
+#
+# The marker file above is only written by shell-render-launch, so a shell
+# that started without it (shim lost to mise's shims regeneration, respawn
+# through the stock launcher) keeps the stale marker: the bar widget would
+# claim "applied software" while the process is back on the nvidia driver.
+# status therefore inspects the running shell instead:
+#   /dev/nvidia* or /dev/dri/* fd open  -> gpu (a driver is really in use)
+#   LIBGL_ALWAYS_SOFTWARE set           -> software (GLX forced onto Mesa)
+#   GALLIUM_DRIVER=llvmpipe             -> software (explicit llvmpipe pin)
+#   otherwise                           -> gpu
+# If several shell processes run, the newest (highest pid) is the live one:
+# a restart replaces the previous instance.
+
+shell_pids() {
+  local d pid
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [[ $(tr -d '\0\n' 2>/dev/null < "$d/comm") == "$SHELL_BIN" ]] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+gpu_fds_open() {
+  # A process holding a /dev/nvidia* fd is on the nvidia driver; a
+  # /dev/dri/* fd means a kernel DRM render node (llvmpipe opens neither).
+  local fd link
+  for fd in "/proc/$1"/fd/*; do
+    [[ -f $fd || -c $fd ]] || continue
+    link=$(readlink -- "$fd" 2>/dev/null) || continue
+    case $link in
+      /dev/nvidia* | /dev/dri/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+software_env() {
+  # The launcher exports these in software mode; their presence in the
+  # process's environ means its GLX/EGL is pinned to Mesa/llvmpipe.
+  local line
+  while IFS= read -r line; do
+    case $line in
+      LIBGL_ALWAYS_SOFTWARE=*) return 0 ;;
+      GALLIUM_DRIVER=llvmpipe) return 0 ;;
+    esac
+  done < <(tr '\0' '\n' 2>/dev/null < "/proc/$1/environ")
+  return 1
+}
+
+applied_live() {
+  local pid newest=0
+  for pid in $(shell_pids); do
+    if (( pid > newest )); then
+      newest=$pid
+    fi
+  done
+  if (( newest == 0 )); then
+    return 1
+  fi
+  if gpu_fds_open "$newest"; then
+    printf 'gpu\n'
+  elif software_env "$newest"; then
+    printf 'software\n'
+  else
+    printf 'gpu\n'
+  fi
+}
+
 applied() {
+  local live
+  if live=$(applied_live); then
+    printf '%s\n' "$live"
+    return 0
+  fi
+  # No shell process running (or its /proc was unreadable): fall back to
+  # the marker the launcher wrote at the last start.
   if [[ -r $APPLIED ]]; then
     local v
     v=$(grep -m1 '^render=' "$APPLIED" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
@@ -64,7 +170,85 @@ write() {
   fi
 }
 
-case ${1:-get} in
+# --- quickshell shim: re-assertion --------------------------------------------
+#
+# On a stock Omarchy install everything that starts the shell (session
+# start, `omarchy restart shell`, the launcher's crash-respawn loop) runs
+# the bare `quickshell`, which resolves through PATH to a shim in mise's
+# shims dir — the first user-writable PATH slot ahead of /usr/bin. mise
+# regenerates that directory on tool changes and drops hand-added entries,
+# so a static shim file is not upgrade-durable: it vanishes at the next
+# mise tool update and later starts silently lose the wrapper. The shim
+# below is generated from this plugin and re-asserted by the bar widget
+# (on load, then every 60s), by shell-render-launch (at every start), and
+# by `shell-render shim` from a terminal.
+
+shim_target() {
+  printf '%s/quickshell' "$SHIMS_DIR"
+}
+
+shim_template() {
+  cat <<EOF
+#!/bin/sh
+# quickshell shim — managed by the ric.shell-render plugin.
+# Do not edit by hand: 'shell-render shim' re-asserts this file (mise
+# drops hand-added entries when it regenerates its shims dir),
+# 'shell-render shim --remove' removes it.
+# Delegates shell launches to the plugin's launcher so the render=
+# setting applies at every start; falls back to the stock binary if the
+# plugin is gone, so the shell always boots.
+L="$PLUGIN_DIR/bin/shell-render-launch"
+if [ -x "\$L" ]; then
+  exec "\$L" /usr/bin/quickshell "\$@"
+fi
+exec /usr/bin/quickshell "\$@"
+EOF
+}
+
+ensure_shim() {
+  # $1 = quiet (1/0)
+  local target want tmp
+  target=$(shim_target)
+  if [[ ! -d $SHIMS_DIR ]]; then
+    if [[ ${1:-0} != 1 ]]; then
+      echo "shell-render: mise shims dir $SHIMS_DIR not found; nothing to do" >&2
+    fi
+    return 0
+  fi
+  want=$(shim_template)
+  if [[ -f $target && ! -L $target && -x $target ]] &&
+    [[ $(cat -- "$target") == "$want" ]]; then
+    if [[ ${1:-0} != 1 ]]; then
+      echo "shim ok: $target"
+    fi
+    return 0
+  fi
+  tmp=$(mktemp -- "${target}.tmp.XXXXXX")
+  printf '%s\n' "$want" > "$tmp"
+  chmod 755 -- "$tmp"
+  mv -f -- "$tmp" "$target"
+  if [[ ${1:-0} != 1 ]]; then
+    echo "shim (re)written: $target"
+  fi
+}
+
+remove_shim() {
+  local target
+  target=$(shim_target)
+  if [[ -e $target || -L $target ]]; then
+    rm -f -- "$target"
+    echo "shim removed: $target"
+  else
+    echo "no shim at $target"
+  fi
+}
+
+cmd=${1:-get}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case $cmd in
   get|"")
     configured
     ;;
@@ -72,16 +256,38 @@ case ${1:-get} in
     printf '%s %s\n' "$(configured)" "$(applied)"
     ;;
   set)
-    [[ $# -ge 2 ]] || { echo "shell-render: set requires gpu|software" >&2; exit 1; }
-    write "$2"
+    if [[ $# -lt 1 ]]; then
+      echo "shell-render: set requires gpu|software" >&2
+      exit 1
+    fi
+    write "$1"
     configured
     ;;
   toggle)
     if [[ $(configured) == "software" ]]; then write gpu; else write software; fi
     configured
     ;;
+  shim)
+    remove=0
+    quiet=0
+    for arg in "$@"; do
+      case $arg in
+        --remove) remove=1 ;;
+        --quiet|-q) quiet=1 ;;
+        *)
+          echo "shell-render: unknown shim option '$arg' (use --remove | --quiet)" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ $remove == 1 ]]; then
+      remove_shim
+    else
+      ensure_shim "$quiet"
+    fi
+    ;;
   *)
-    echo "shell-render: unknown command '$1' (get|status|set|toggle)" >&2
+    echo "shell-render: unknown command '$cmd' (get|status|set|toggle|shim)" >&2
     exit 1
     ;;
 esac

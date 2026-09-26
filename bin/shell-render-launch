@@ -15,10 +15,22 @@
 # At start-up the script records the backend the shell was launched with in
 # ~/.config/omarchy/shell-render.applied, so the UI can flag a saved-but-not
 # yet applied switch ("restart pending").
+#
+# It also re-asserts the quickshell shim in mise's shims dir: mise
+# regenerates that dir on tool changes and drops hand-added entries, so
+# without this the wiring is lost at the next tool update and later
+# starts (stock respawn, `omarchy restart shell`) miss the wrapper and
+# silently revert to the GPU backend.
 set -u
 
 CONF="${SHELL_RENDER_CONF:-$HOME/.config/omarchy/shell-render.conf}"
 APPLIED="${SHELL_RENDER_APPLIED:-$HOME/.config/omarchy/shell-render.applied}"
+
+# Best effort: never block the shell start over shim bookkeeping.
+CLI="$(dirname -- "$0")/shell-render"
+if [[ -x $CLI ]]; then
+  "$CLI" shim --quiet >/dev/null 2>&1 || true
+fi
 
 render="gpu"
 if [[ -r $CONF ]]; then
