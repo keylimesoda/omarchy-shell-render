@@ -1,53 +1,133 @@
 #!/bin/bash
-# shell-render — get/set the Omarchy shell (bar + menu) render backend.
+# shell-render — get/set render backends for the Omarchy shell (bar + menu)
+# and the default web browser (Edge / Chromium).
 #
-#   shell-render            print configured backend (gpu|software)
-#   shell-render get        same
-#   shell-render status     print "configured applied". "applied" is verified
-#                           against the *live* shell process (its /proc
-#                           environ and open device fds), not the marker
-#                           file: a start that missed the launcher wrapper
-#                           (shim lost, stock respawn) can run on the GPU
-#                           while the marker still says software. The marker
-#                           file is consulted only when no shell process is
-#                           running.
-#   shell-render set MODE   gpu|software (persisted; takes effect on the next
-#                           shell start via the launcher wrapper)
-#   shell-render toggle     flip and print the new value
-#   shell-render shim       verify/repair the quickshell shim in mise's shims
-#                           dir (--remove deletes it, --quiet prints nothing).
-#                           mise regenerates that directory on tool changes
-#                           and drops hand-added entries, so without
-#                           re-assertion the launcher wiring is lost at the
-#                           next tool update and shell starts silently
-#                           revert to the GPU backend. The bar widget
-#                           re-asserts the shim on load and every 60s; this
-#                           is the manual hook (also run by
-#                           shell-render-launch at every start).
-
-# Optional invocation trace: set SHELL_RENDER_TRACE=/path, or create the
-# default $XDG_RUNTIME_DIR/shell-render-trace sentinel file; each call is
-# logged there (timestamp, args, pid).
+# Shell (backend applies on shell (re)start via the launcher wrapper and
+# the quickshell shim):
+#   shell-render                        print configured shell backend (gpu|software)
+#   shell-render get                    same
+#   shell-render status [shell|browser] print "<configured> <applied>"
+#       "applied" is verified against the LIVE process, never a stale
+#       marker: shell — nvidia/DRM fds in /proc/<pid>/fd, LIBGL_ALWAYS_
+#       SOFTWARE / GALLIUM_DRIVER in /proc/<pid>/environ; the
+#       shell-render.applied marker is only the fallback when no shell
+#       process is running. browser — a running process whose command
+#       line carries --use-angle=swiftshader is on the CPU; open
+#       nvidia/DRM fds mean the driver is really in use; when the
+#       browser is not running, the value the browser flags file will
+#       hand the next start is reported.
+#   shell-render both                   "<shellCfg> <shellApplied>
+#                                       <browserCfg> <browserApplied>
+#                                       <browserProfile>" — what the bar
+#                                       widget polls; "unsupported"
+#                                       tokens when no supported browser
+#                                       profile applies
+#   shell-render set MODE [target]      MODE=gpu|software, target=shell
+#                                       (default) | browser
+#   shell-render toggle [target]        flip and print the new value
+#
+# Browser (Edge / Chromium): the setting is delivered through the
+# vendor-provided user-flags file, which both wrappers read on EVERY
+# start (session start, xdg-open, omarchy-launch-browser, terminals):
+#   edge:     ~/.config/microsoft-edge-stable-flags.conf
+#   chromium: ~/.config/chromium-flags.conf
+# The plugin keeps one managed line in that file: --use-angle=swiftshader
+# is present in software mode and absent in gpu mode (everything else —
+# user flags, Omarchy policy lines — is preserved; no comment markers,
+# because the Edge wrapper is a bash script that would pass `#` lines to
+# the browser as literal arguments). The bar widget re-asserts the line
+# on load and every 60s, so a system update that regenerates the file
+# cannot silently drop the setting; 'shell-render maintain' does the same
+# from a terminal.
+#   shell-render browser status|toggle|restart|sync
+#   shell-render browser set MODE
+#   shell-render browser restart   restart a running browser via
+#                                  omarchy-restart-app (session restores)
+#   shell-render shim [--remove|--quiet]
+#                                  verify/repair the quickshell shim in
+#                                  mise's shims dir (mise regenerates that
+#                                  dir on tool changes and drops
+#                                  hand-added entries; the bar widget also
+#                                  re-asserts it on load + every 60s)
+#   shell-render maintain [--quiet]
+#                                  re-assert the shim AND the browser
+#                                  flags block (what the bar widget runs)
 #
 # State:   $HOME/.config/omarchy/shell-render.conf        (render=...)
-# Marker:  $HOME/.config/omarchy/shell-render.applied     (written by
-#           shell-render-launch at shell start)
-# Both paths can be overridden via $SHELL_RENDER_CONF / $SHELL_RENDER_APPLIED.
-# Shell binary name that status matches against: $SHELL_RENDER_SHELL
-# (default: quickshell). Mise shims dir: $MISE_DATA_DIR (default
-# ~/.local/share/mise), subdirectory "shims".
+#          $HOME/.config/omarchy/shell-render.applied     (written by
+#          shell-render-launch at shell start; status fallback only)
+#          $HOME/.config/omarchy/browser-render.conf      (render=...)
+# Overrides: $SHELL_RENDER_CONF, $SHELL_RENDER_APPLIED,
+#            $SHELL_RENDER_SHELL (comm to match, default: quickshell),
+#            $SHELL_RENDER_BROWSER (auto|edge|chromium),
+#            $SHELL_RENDER_BROWSER_STATE, $SHELL_RENDER_BROWSER_CONF,
+#            $MISE_DATA_DIR (default ~/.local/share/mise).
+# Optional invocation trace: set $SHELL_RENDER_TRACE=/path, or create the
+# default $XDG_RUNTIME_DIR/shell-render-trace sentinel file.
 set -euo pipefail
 
 CONF="${SHELL_RENDER_CONF:-$HOME/.config/omarchy/shell-render.conf}"
 APPLIED="${SHELL_RENDER_APPLIED:-$HOME/.config/omarchy/shell-render.applied}"
 SHELL_BIN="${SHELL_RENDER_SHELL:-quickshell}"
 SHIMS_DIR="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+BROWSER_STATE="${SHELL_RENDER_BROWSER_STATE:-$HOME/.config/omarchy/browser-render.conf}"
 PLUGIN_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
-
 TRACE="${SHELL_RENDER_TRACE:-${XDG_RUNTIME_DIR:-/tmp}/shell-render-trace}"
 if [[ -n ${SHELL_RENDER_TRACE:-} || -e $TRACE ]]; then
   printf '%s shell-render %s (pid %d)\n' "$(date '+%H:%M:%S')" "${*:-get}" "$$" >> "$TRACE" 2>/dev/null || true
 fi
+
+# --- Browser profile ---------------------------------------------------------
+# Supported browsers are the Chromium family (Edge, Chromium) — both ship a
+# wrapper that appends the user-flags file on every start, which is how the
+# setting is delivered regardless of launch path. Other browsers are
+# reported as "unsupported" (override with SHELL_RENDER_BROWSER).
+
+BROWSER_SW_FLAG="--use-angle=swiftshader"
+# Legacy markers from the first managed-block format: kept only so the
+# one-time migration below can strip them from existing files. The
+# current invariant is markerless (see sync_browser_flags).
+BROWSER_LEGACY_BEG="# BEGIN ric.shell-render (managed block - do not edit)"
+BROWSER_LEGACY_END="# END ric.shell-render"
+
+browser_profile() {
+  local want=${SHELL_RENDER_BROWSER:-auto} desktop
+  if [[ $want != "auto" ]]; then
+    case $want in
+      edge|chromium) printf '%s' "$want" ;;
+      *) printf 'none' ;;
+    esac
+    return
+  fi
+  desktop=$(xdg-settings get default-web-browser 2>/dev/null || true)
+  case $desktop in
+    microsoft-edge*) printf 'edge' ;;
+    chromium*) printf 'chromium' ;;
+    *) printf 'none' ;;
+  esac
+}
+
+BROWSER_PROFILE=$(browser_profile)
+BROWSER_BIN=""
+BROWSER_EXEC=""
+BROWSER_LABEL="browser"
+BROWSER_CONF=""
+case $BROWSER_PROFILE in
+  edge)
+    BROWSER_BIN="microsoft-edge"
+    BROWSER_EXEC="microsoft-edge-stable"
+    BROWSER_LABEL="Microsoft Edge"
+    BROWSER_CONF="${SHELL_RENDER_BROWSER_CONF:-$HOME/.config/microsoft-edge-stable-flags.conf}"
+    ;;
+  chromium)
+    BROWSER_BIN="chromium"
+    BROWSER_EXEC="chromium"
+    BROWSER_LABEL="Chromium"
+    BROWSER_CONF="${SHELL_RENDER_BROWSER_CONF:-$HOME/.config/chromium-flags.conf}"
+    ;;
+esac
+
+# --- Shell: configured / applied ---------------------------------------------
 
 configured() {
   if [[ -r $CONF ]]; then
@@ -61,19 +141,13 @@ configured() {
   printf 'gpu\n'
 }
 
-# --- Live process verification -----------------------------------------------
-#
-# The marker file above is only written by shell-render-launch, so a shell
-# that started without it (shim lost to mise's shims regeneration, respawn
-# through the stock launcher) keeps the stale marker: the bar widget would
-# claim "applied software" while the process is back on the nvidia driver.
-# status therefore inspects the running shell instead:
-#   /dev/nvidia* or /dev/dri/* fd open  -> gpu (a driver is really in use)
-#   LIBGL_ALWAYS_SOFTWARE set           -> software (GLX forced onto Mesa)
-#   GALLIUM_DRIVER=llvmpipe             -> software (explicit llvmpipe pin)
-#   otherwise                           -> gpu
-# If several shell processes run, the newest (highest pid) is the live one:
-# a restart replaces the previous instance.
+# Live process verification: the shell-render.applied marker is only written
+# by shell-render-launch, so a start that missed the wrapper (shim lost,
+# stock respawn) keeps the stale marker. status therefore inspects the
+# running shell: /dev/nvidia* or /dev/dri/* fd -> gpu;
+# LIBGL_ALWAYS_SOFTWARE / GALLIUM_DRIVER=llvmpipe in environ -> software;
+# otherwise gpu. If several shells run, the newest (highest pid) is the
+# live one: a restart replaces the previous instance.
 
 shell_pids() {
   local d pid
@@ -148,7 +222,6 @@ applied() {
   fi
   printf 'gpu\n'
 }
-
 write() {
   local mode=$1
   [[ $mode == "gpu" || $mode == "software" ]] || {
@@ -168,6 +241,211 @@ write() {
   else
     printf 'render=%s\n' "$mode" > "$CONF"
   fi
+}
+
+# --- Browser: configured / applied -------------------------------------------
+#
+# Software mode is delivered as a $BROWSER_SW_FLAG line in the browser's
+# user-flags file; both Edge and Chromium wrappers read that file on every
+# start, so the setting holds for every launch path.
+
+browser_configured() {
+  if [[ -r $BROWSER_STATE ]]; then
+    local v
+    v=$(grep -m1 '^render=' "$BROWSER_STATE" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+    if [[ $v == "software" || $v == "gpu" ]]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  fi
+  printf 'gpu\n'
+}
+
+browser_write() {
+  local mode=$1
+  [[ $mode == "gpu" || $mode == "software" ]] || {
+    echo "shell-render: unknown mode '$mode' (use gpu|software)" >&2
+    return 1
+  }
+  mkdir -p "$(dirname "$BROWSER_STATE")"
+  if [[ -r $BROWSER_STATE ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk -v m="$mode" '
+      /^render=/ { print "render=" m; seen = 1; next }
+      { print }
+      END { if (!seen) print "render=" m }
+    ' "$BROWSER_STATE" > "$tmp" && mv "$tmp" "$BROWSER_STATE"
+  else
+    printf 'render=%s\n' "$mode" > "$BROWSER_STATE"
+  fi
+  sync_browser_flags "$mode" 1
+}
+
+sync_browser_flags() {
+  # Enforce the managed invariant in the browser's user-flags file:
+  # software mode -> a $BROWSER_SW_FLAG line is present (once),
+  # gpu mode -> it is absent. Everything else in the file is preserved.
+  #
+  # Deliberately markerless: the Edge wrapper is a bash script that
+  # unquoted-expands the file, so `#` comment lines would be passed to
+  # the browser as literal arguments (becoming URL "targets"); a plain
+  # flag line is safe with both wrappers. Legacy marker lines from the
+  # first managed-block format are stripped on first sync.
+  # $1 = mode (gpu|software), $2 = quiet.
+  local mode=$1 quiet=${2:-0} tmp
+  if [[ -z $BROWSER_CONF ]]; then
+    return 0
+  fi
+  if grep -qxF -- "$BROWSER_LEGACY_BEG" "$BROWSER_CONF" 2>/dev/null ||
+     grep -qxF -- "$BROWSER_LEGACY_END" "$BROWSER_CONF" 2>/dev/null; then
+    # One-time migration: strip legacy marker lines.
+    tmp=$(mktemp)
+    grep -vxF -- "$BROWSER_LEGACY_BEG" "$BROWSER_CONF" 2>/dev/null |
+      grep -vxF -- "$BROWSER_LEGACY_END" > "$tmp" || true
+    mv "$tmp" "$BROWSER_CONF"
+  fi
+  if [[ $mode == "software" ]]; then
+    if ! grep -qxF -- "$BROWSER_SW_FLAG" "$BROWSER_CONF" 2>/dev/null; then
+      tmp=$(mktemp)
+      if [[ -r $BROWSER_CONF ]]; then
+        cat "$BROWSER_CONF" > "$tmp"
+      else
+        : > "$tmp"
+      fi
+      if [[ -s $tmp && -n $(tail -c1 -- "$tmp") ]]; then
+        printf '\n' >> "$tmp"
+      fi
+      printf '%s\n' "$BROWSER_SW_FLAG" >> "$tmp"
+      mv "$tmp" "$BROWSER_CONF"
+    fi
+  else
+    if grep -qxF -- "$BROWSER_SW_FLAG" "$BROWSER_CONF" 2>/dev/null; then
+      tmp=$(mktemp)
+      grep -vxF -- "$BROWSER_SW_FLAG" "$BROWSER_CONF" > "$tmp" || true
+      mv "$tmp" "$BROWSER_CONF"
+    fi
+  fi
+  if [[ $quiet != 1 ]]; then
+    echo "browser flags ok: $BROWSER_CONF ($mode)"
+  fi
+}
+
+browser_pids() {
+  # Browsers rename their processes: every Edge process (main, zygotes,
+  # gpu, renderers) carries comm "msedge", never the binary's file name,
+  # so /proc matching must use the title; the binary name is kept as a
+  # fallback for builds without process titles.
+  local d pid comm
+  case $BROWSER_PROFILE in
+    edge) local pat="^(msedge|microsoft-edge)$" ;;
+    chromium) local pat="^(chromium|Chromium)$" ;;
+    *) return 0 ;;
+  esac
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    comm=$(tr -d '\0\n' 2>/dev/null < "$d/comm") || continue
+    [[ $comm =~ $pat ]] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+applied_browser_live() {
+  # --use-angle=swiftshader in any process command line wins over device
+  # fds (a renderer may still touch a DRM node for dmabuf imports);
+  # otherwise an open nvidia/DRM fd means the driver is really in use, and
+  # a browser running without the flag defaults to the GPU when available.
+  local pid any=0 gpu=0 flag=0
+  for pid in $(browser_pids); do
+    any=1
+    case $(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") in
+      *"$BROWSER_SW_FLAG"*) flag=1 ;;
+    esac
+    if (( flag == 0 )) && gpu_fds_open "$pid"; then
+      gpu=1
+    fi
+  done
+  if (( any == 0 )); then
+    return 1
+  fi
+  if (( flag )); then
+    printf 'software\n'
+  else
+    printf 'gpu\n'
+  fi
+}
+
+browser_applied() {
+  local live
+  if live=$(applied_browser_live); then
+    printf '%s\n' "$live"
+    return 0
+  fi
+  # Browser not running: what the next start will use = what the flags
+  # file actually contains right now (a stale file is reported, not
+  # papered over).
+  if [[ -n $BROWSER_CONF && -r $BROWSER_CONF ]] &&
+    grep -qxF -- "$BROWSER_SW_FLAG" "$BROWSER_CONF"; then
+    printf 'software\n'
+  else
+    printf 'gpu\n'
+  fi
+}
+
+browser_status() {
+  if [[ $BROWSER_PROFILE == "none" ]]; then
+    printf 'unsupported unsupported\n'
+    return 0
+  fi
+  printf '%s %s\n' "$(browser_configured)" "$(browser_applied)"
+}
+
+both_tokens() {
+  local sc sa bc ba
+  sc=$(configured)
+  sa=$(applied)
+  if [[ $BROWSER_PROFILE == "none" ]]; then
+    printf '%s %s unsupported unsupported unsupported' "$sc" "$sa"
+  else
+    bc=$(browser_configured)
+    ba=$(browser_applied)
+    printf '%s %s %s %s %s' "$sc" "$sa" "$bc" "$ba" "$BROWSER_PROFILE"
+  fi
+}
+
+browser_restart() {
+  if [[ $BROWSER_PROFILE == "none" ]]; then
+    echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+    return 1
+  fi
+  local pid any=0
+  for pid in $(browser_pids); do
+    any=1
+  done
+  if (( any == 0 )); then
+    echo "shell-render: $BROWSER_LABEL is not running; nothing to restart"
+    return 0
+  fi
+  # pkill -x matches the process title, which Edge sets to "msedge";
+  # relaunch through the wrapper binary so the plugin-managed user-flags
+  # file is applied to the new instance.
+  case $BROWSER_PROFILE in
+    edge)
+      pkill -x msedge 2>/dev/null || true
+      pkill -x microsoft-edge 2>/dev/null || true
+      ;;
+    chromium)
+      pkill -x chromium 2>/dev/null || true
+      ;;
+  esac
+  sleep 1
+  if ! command -v uwsm-app >/dev/null 2>&1 ||
+     ! command -v "$BROWSER_EXEC" >/dev/null 2>&1; then
+    echo "shell-render: relaunch failed (uwsm-app/$BROWSER_EXEC missing); $BROWSER_LABEL was killed" >&2
+    return 1
+  fi
+  setsid uwsm-app -- "$BROWSER_EXEC" >/dev/null 2>&1 &
+  echo "shell-render: restarted $BROWSER_LABEL (previous session restores on relaunch)"
 }
 
 # --- quickshell shim: re-assertion --------------------------------------------
@@ -243,6 +521,20 @@ remove_shim() {
   fi
 }
 
+maintain() {
+  # $1 = quiet (1/0): everything the bar widget keeps alive on its own —
+  # the quickshell shim and the browser flags block.
+  ensure_shim "${1:-0}"
+  if [[ $BROWSER_PROFILE != "none" ]]; then
+    sync_browser_flags "$(browser_configured)" "${1:-0}"
+  fi
+}
+
+# --- Dispatch ------------------------------------------------------------------
+#
+# Backwards compatible: with no target the shell is the target, so
+# `shell-render`, `status`, `set MODE`, `toggle` behave as before.
+
 cmd=${1:-get}
 if [[ $# -gt 0 ]]; then
   shift
@@ -253,19 +545,121 @@ case $cmd in
     configured
     ;;
   status)
-    printf '%s %s\n' "$(configured)" "$(applied)"
+    case ${1:-shell} in
+      shell)
+        printf '%s %s\n' "$(configured)" "$(applied)"
+        ;;
+      browser)
+        printf '%s\n' "$(browser_status)"
+        ;;
+      both)
+        printf '%s\n' "$(both_tokens)"
+        ;;
+      *)
+        echo "shell-render: unknown target '${1}' (use shell|browser|both)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  both)
+    printf '%s\n' "$(both_tokens)"
     ;;
   set)
     if [[ $# -lt 1 ]]; then
-      echo "shell-render: set requires gpu|software" >&2
+      echo "shell-render: set requires gpu|software [shell|browser]" >&2
       exit 1
     fi
-    write "$1"
-    configured
+    case ${2:-shell} in
+      shell)
+        write "$1"
+        configured
+        ;;
+      browser)
+        if [[ $BROWSER_PROFILE == "none" ]]; then
+          echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+          exit 1
+        fi
+        browser_write "$1"
+        browser_configured
+        ;;
+      *)
+        echo "shell-render: unknown target '${2}' (use shell|browser)" >&2
+        exit 1
+        ;;
+    esac
     ;;
   toggle)
-    if [[ $(configured) == "software" ]]; then write gpu; else write software; fi
-    configured
+    case ${1:-shell} in
+      shell)
+        if [[ $(configured) == "software" ]]; then write gpu; else write software; fi
+        configured
+        ;;
+      browser)
+        if [[ $BROWSER_PROFILE == "none" ]]; then
+          echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+          exit 1
+        fi
+        if [[ $(browser_configured) == "software" ]]; then
+          browser_write gpu
+        else
+          browser_write software
+        fi
+        browser_configured
+        ;;
+      *)
+        echo "shell-render: unknown target '${1}' (use shell|browser)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  browser)
+    bcmd=${1:-status}
+    if [[ $# -gt 0 ]]; then
+      shift
+    fi
+    case $bcmd in
+      status)
+        printf '%s\n' "$(browser_status)"
+        ;;
+      set)
+        if [[ $# -lt 1 ]]; then
+          echo "shell-render: set requires gpu|software" >&2
+          exit 1
+        fi
+        if [[ $BROWSER_PROFILE == "none" ]]; then
+          echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+          exit 1
+        fi
+        browser_write "$1"
+        browser_configured
+        ;;
+      toggle)
+        if [[ $BROWSER_PROFILE == "none" ]]; then
+          echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+          exit 1
+        fi
+        if [[ $(browser_configured) == "software" ]]; then
+          browser_write gpu
+        else
+          browser_write software
+        fi
+        browser_configured
+        ;;
+      restart)
+        browser_restart
+        ;;
+      sync)
+        if [[ $BROWSER_PROFILE == "none" ]]; then
+          echo "shell-render: no supported browser profile (SHELL_RENDER_BROWSER=edge|chromium)" >&2
+          exit 1
+        fi
+        sync_browser_flags "$(browser_configured)"
+        ;;
+      *)
+        echo "shell-render: unknown browser command '$bcmd' (status|set|toggle|restart|sync)" >&2
+        exit 1
+        ;;
+    esac
     ;;
   shim)
     remove=0
@@ -286,8 +680,21 @@ case $cmd in
       ensure_shim "$quiet"
     fi
     ;;
+  maintain)
+    quiet=0
+    for arg in "$@"; do
+      case $arg in
+        --quiet|-q) quiet=1 ;;
+        *)
+          echo "shell-render: unknown maintain option '$arg' (use --quiet)" >&2
+          exit 1
+          ;;
+      esac
+    done
+    maintain "$quiet"
+    ;;
   *)
-    echo "shell-render: unknown command '$cmd' (get|status|set|toggle|shim)" >&2
+    echo "shell-render: unknown command '$cmd' (get|status|both|set|toggle|browser|shim|maintain)" >&2
     exit 1
     ;;
 esac
